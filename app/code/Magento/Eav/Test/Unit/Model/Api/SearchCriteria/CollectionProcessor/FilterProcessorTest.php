@@ -13,6 +13,7 @@ use Magento\Framework\Api\Search\FilterGroup;
 use Magento\Framework\Api\SearchCriteria\CollectionProcessor\FilterProcessor\CustomFilterInterface;
 use Magento\Framework\Api\SearchCriteriaInterface;
 use Magento\Framework\Data\Collection\AbstractDb;
+use Magento\Framework\DB\Select;
 use PHPUnit\Framework\MockObject\MockObject;
 use PHPUnit\Framework\TestCase;
 use Magento\Framework\TestFramework\Unit\Helper\MockCreationTrait;
@@ -35,6 +36,9 @@ class FilterProcessorTest extends TestCase
 
     /**
      * @SuppressWarnings(PHPMD.ExcessiveMethodLength)
+     */
+    /**
+     * A custom filter that adds no WHERE condition cannot be OR-ed, so its group keeps the AND behaviour
      */
     public function testProcess()
     {
@@ -77,7 +81,7 @@ class FilterProcessorTest extends TestCase
 
         /** @var Filter|MockObject $filterOneMock */
         $filterOneMock = $this->createMock(Filter::class);
-        $filterOneMock->expects($this->once())
+        $filterOneMock->expects($this->exactly(2))
             ->method('getField')
             ->willReturn($customFilterField);
 
@@ -123,10 +127,13 @@ class FilterProcessorTest extends TestCase
 
         /** @var AbstractDb|MockObject $searchCriteriarMock */
         $collectionMock = $this->createMock(AbstractDb::class);
+        $selectMock = $this->createStub(Select::class);
+        $selectMock->method('getPart')->willReturn([]);
+        $collectionMock->method('getSelect')->willReturn($selectMock);
 
-        $customFilterMock->expects($this->once())
+        $customFilterMock->expects($this->exactly(2))
             ->method('apply')
-            ->with($filterOneMock, $collectionMock)
+            ->with($filterOneMock, $this->isInstanceOf(AbstractDb::class))
             ->willReturn(true);
 
         $collectionMock->expects($this->exactly(2))
@@ -138,6 +145,47 @@ class FilterProcessorTest extends TestCase
             });
 
         $model->process($searchCriteriaMock, $collectionMock);
+    }
+
+    /**
+     * A custom filter and a plain field in one group are combined with OR (magento/magento2#16425)
+     */
+    public function testProcessOrsCustomFilterWithPlainField(): void
+    {
+        $customFilterMock = $this->createMock(CustomFilterInterface::class);
+        $model = $this->getModel(['custom' => $customFilterMock], []);
+
+        $customFilter = $this->createStub(Filter::class);
+        $customFilter->method('getField')->willReturn('custom');
+        $plainFilter = $this->createStub(Filter::class);
+        $plainFilter->method('getField')->willReturn('plain');
+        $plainFilter->method('getValue')->willReturn('value');
+        $plainFilter->method('getConditionType')->willReturn('eq');
+
+        $group = $this->createStub(FilterGroup::class);
+        $group->method('getFilters')->willReturn([$customFilter, $plainFilter]);
+        $searchCriteria = $this->createStub(SearchCriteriaInterface::class);
+        $searchCriteria->method('getFilterGroups')->willReturn([$group]);
+
+        $parts = [
+            Select::FROM => [['from'], ['from']],
+            Select::WHERE => [['(custom_condition)'], ['(earlier_group)'], ['(plain_condition)']],
+        ];
+        $select = $this->createMock(Select::class);
+        $select->method('getPart')->willReturnCallback(function ($part) use (&$parts) {
+            return array_shift($parts[$part]);
+        });
+        $select->expects($this->once())->method('setPart')->with(Select::WHERE, ['(earlier_group)']);
+        $select->expects($this->once())->method('where')
+            ->with('((custom_condition)) OR ((plain_condition))', null, Select::TYPE_CONDITION);
+
+        $collection = $this->createMock(AbstractDb::class);
+        $collection->method('getSelect')->willReturn($select);
+        $collection->expects($this->once())->method('addFieldToFilter')
+            ->with([['attribute' => 'plain', 'eq' => 'value']]);
+        $customFilterMock->expects($this->once())->method('apply')->willReturn(true);
+
+        $model->process($searchCriteria, $collection);
     }
 
     public function testProcessWithException()
